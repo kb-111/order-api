@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uuid
@@ -13,21 +13,24 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Retry-After"],
 )
 
 # -----------------------------
-# In-memory storage
+# Constants
 # -----------------------------
-orders_created = {}
-rate_limits = {}
-
 TOTAL_ORDERS = 49
 RATE_LIMIT = 19
 WINDOW = 10  # seconds
 
+# -----------------------------
+# In-memory storage
+# -----------------------------
+orders_created = {}   # Idempotency-Key -> Order
+rate_limits = {}      # Client ID -> timestamps
 
 # -----------------------------
 # Models
@@ -37,15 +40,53 @@ class OrderRequest(BaseModel):
 
 
 # -----------------------------
+# Rate Limiting Middleware
+# -----------------------------
+@app.middleware("http")
+async def rate_limiter(request: Request, call_next):
+
+    client_id = request.headers.get("X-Client-Id")
+
+    if client_id:
+
+        now = time.time()
+
+        timestamps = rate_limits.get(client_id, [])
+
+        # Keep only timestamps in last 10 seconds
+        timestamps = [t for t in timestamps if now - t < WINDOW]
+
+        if len(timestamps) >= RATE_LIMIT:
+
+            retry_after = max(1, int(WINDOW - (now - timestamps[0])) + 1)
+
+            return Response(
+                content="Rate limit exceeded",
+                status_code=429,
+                headers={
+                    "Retry-After": str(retry_after)
+                },
+            )
+
+        timestamps.append(now)
+        rate_limits[client_id] = timestamps
+
+    response = await call_next(request)
+    return response
+
+
+# -----------------------------
 # POST /orders
 # -----------------------------
-@app.post("/orders", status_code=201)
+@app.post("/orders")
 def create_order(
     order: OrderRequest,
     response: Response,
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ):
+
     if idempotency_key in orders_created:
+        response.status_code = 201
         return orders_created[idempotency_key]
 
     new_order = {
@@ -55,6 +96,8 @@ def create_order(
 
     orders_created[idempotency_key] = new_order
 
+    response.status_code = 201
+
     return new_order
 
 
@@ -62,27 +105,35 @@ def create_order(
 # GET /orders
 # -----------------------------
 @app.get("/orders")
-def list_orders(limit: int = 10, cursor: str | None = None):
+def get_orders(limit: int = 10, cursor: str | None = None):
+
+    if limit <= 0:
+        limit = 10
 
     if cursor is None:
         start = 1
     else:
-        start = int(base64.b64decode(cursor).decode())
+        try:
+            start = int(base64.b64decode(cursor).decode())
+        except Exception:
+            start = 1
 
     end = min(start + limit - 1, TOTAL_ORDERS)
 
-    items = [
-        {
+    items = []
+
+    for i in range(start, end + 1):
+        items.append({
             "id": i,
             "name": f"Order {i}"
-        }
-        for i in range(start, end + 1)
-    ]
+        })
 
     if end >= TOTAL_ORDERS:
         next_cursor = None
     else:
-        next_cursor = base64.b64encode(str(end + 1).encode()).decode()
+        next_cursor = base64.b64encode(
+            str(end + 1).encode()
+        ).decode()
 
     return {
         "items": items,
@@ -91,40 +142,10 @@ def list_orders(limit: int = 10, cursor: str | None = None):
 
 
 # -----------------------------
-# Rate Limiting Middleware
+# Root endpoint (optional)
 # -----------------------------
-@app.middleware("http")
-async def limiter(request, call_next):
-
-    client = request.headers.get("X-Client-Id")
-
-    if client:
-
-        now = time.time()
-
-        timestamps = rate_limits.get(client, [])
-
-        timestamps = [
-            t for t in timestamps
-            if now - t < WINDOW
-        ]
-
-        if len(timestamps) >= RATE_LIMIT:
-
-            retry = WINDOW - (now - timestamps[0])
-
-            return Response(
-                content="Rate limit exceeded",
-                status_code=429,
-                headers={
-                    "Retry-After": str(int(retry) + 1)
-                },
-            )
-
-        timestamps.append(now)
-
-        rate_limits[client] = timestamps
-
-    response = await call_next(request)
-
-    return response
+@app.get("/")
+def root():
+    return {
+        "message": "Orders API is running."
+    }
